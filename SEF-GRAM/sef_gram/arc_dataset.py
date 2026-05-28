@@ -38,7 +38,7 @@ class ARCGridDecoder(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.fc = nn.Sequential(
-            nn.Linear(latent_dim, 64 * 5 * 5),
+            nn.Linear(2 * latent_dim, 64 * 5 * 5),
             nn.ReLU()
         )
         self.deconv = nn.Sequential(
@@ -49,10 +49,25 @@ class ARCGridDecoder(nn.Module):
             nn.ConvTranspose2d(32, vocab_size, kernel_size=3, padding=1)
         )
         
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, z_rule: torch.Tensor = None) -> torch.Tensor:
         # z: [B, T, latent_dim]
         B, T, D = z.shape
-        x = self.fc(z.reshape(-1, D))
+        
+        if z_rule is None:
+            # Backwards compatibility: zero padding
+            rule_context = torch.zeros(B, D, device=z.device)
+        else:
+            # z_rule: [B, num_slots, latent_dim]
+            if z_rule.dim() == 3:
+                rule_context = z_rule.mean(dim=1) # [B, latent_dim]
+            else:
+                rule_context = z_rule # already pooled
+                
+        # Expand and concat
+        rule_context = rule_context.unsqueeze(1).expand(B, T, D)
+        z_concat = torch.cat([z, rule_context], dim=-1) # [B, T, 2*D]
+        
+        x = self.fc(z_concat.reshape(-1, 2 * D))
         x = x.reshape(-1, 64, 5, 5)
         logits = self.deconv(x) # [B*T, vocab_size, 30, 30]
         return logits.reshape(B, T, self.vocab_size, 30, 30)
