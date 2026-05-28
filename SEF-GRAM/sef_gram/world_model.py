@@ -122,6 +122,34 @@ class UniversalWorldModel(nn.Module):
             "target_done": batch.dones.float().view(-1),
         }
 
+    def init_state(self, obs: Tensor, sample_context: bool = True) -> Dict[str, Tensor]:
+        """Initialize a recurrent latent rollout state from an observation.
+
+        Unlike `predict_step`, the returned state carries EFLA memory across future
+        calls to `stateful_step`. This is needed for partially observable/memory
+        tasks where a fact is visible early and hidden later.
+        """
+
+        obs = pad_obs(obs, self.cfg.max_obs_dim)
+        enc = self.core.encode_context(obs, sample=sample_context)
+        memory = self.core.initial_memory(obs.shape[0], obs.device)
+        return {"z": enc["z"], "memory": memory, "context_mu": enc["mu"], "context_logvar": enc["logvar"]}
+
+    def stateful_step(self, state: Dict[str, Tensor], actions: Tensor) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+        """Advance a recurrent latent state by one action without re-encoding obs."""
+
+        step = self.core.transition(state["z"], actions.long().view(-1), state["memory"])
+        z = step["z_next"]
+        next_state = {"z": z, "memory": step["memory_next"], "context_mu": state["context_mu"], "context_logvar": state["context_logvar"]}
+        out = {
+            "next_obs": self.obs_decoder(z),
+            "reward": self.reward_head(z).squeeze(-1),
+            "done_logit": self.done_head(z).squeeze(-1),
+            "prior_mu": step["prior_mu"],
+            "prior_logvar": step["prior_logvar"],
+        }
+        return next_state, out
+
     def loss(self, batch: WorldBatch) -> Tuple[Tensor, Dict[str, Tensor]]:
         out = self.forward(batch)
 
