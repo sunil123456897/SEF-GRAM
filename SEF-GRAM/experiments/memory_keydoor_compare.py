@@ -14,7 +14,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from sef_gram.world_baselines import MLPWorldModel, MLPWorldModelConfig
+from sef_gram.world_baselines import GRUWorldModel, GRUWorldModelConfig, MLPWorldModel, MLPWorldModelConfig
 from sef_gram.world_model import UniversalWorldModel, WorldBatch, WorldModelConfig, pad_obs
 
 
@@ -123,11 +123,7 @@ class MemoryKeyDoorSequenceEnv:
             "goal": state["goal"],
             "has_key": next_has_key,
         }
-        events = {
-            "blocked": blocked.float(),
-            "key_pickup": key_pickup.float(),
-            "naive_moved": naive_moved.float(),
-        }
+        events = {"blocked": blocked.float(), "key_pickup": key_pickup.float(), "naive_moved": naive_moved.float()}
         return next_state, reward, done, events
 
     def sample_sequence(self, batch_size: int, horizon: int, device: torch.device):
@@ -179,11 +175,7 @@ def rollout_predict_sef(model: UniversalWorldModel, seq: Dict[str, torch.Tensor]
         pred_obs.append(pred["next_obs"])
         pred_rewards.append(pred["reward"])
         pred_done_logits.append(pred["done_logit"])
-    return {
-        "next_obs": torch.stack(pred_obs, dim=1),
-        "reward": torch.stack(pred_rewards, dim=1),
-        "done_logit": torch.stack(pred_done_logits, dim=1),
-    }
+    return {"next_obs": torch.stack(pred_obs, dim=1), "reward": torch.stack(pred_rewards, dim=1), "done_logit": torch.stack(pred_done_logits, dim=1)}
 
 
 def rollout_predict_mlp(model: MLPWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Dict[str, torch.Tensor]:
@@ -204,11 +196,22 @@ def rollout_predict_mlp(model: MLPWorldModel, seq: Dict[str, torch.Tensor], cfg:
         pred_obs.append(current_obs)
         pred_rewards.append(pred["pred_reward"])
         pred_done_logits.append(pred["pred_done_logit"])
-    return {
-        "next_obs": torch.stack(pred_obs, dim=1),
-        "reward": torch.stack(pred_rewards, dim=1),
-        "done_logit": torch.stack(pred_done_logits, dim=1),
-    }
+    return {"next_obs": torch.stack(pred_obs, dim=1), "reward": torch.stack(pred_rewards, dim=1), "done_logit": torch.stack(pred_done_logits, dim=1)}
+
+
+def rollout_predict_gru(model: GRUWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Dict[str, torch.Tensor]:
+    pred_obs = []
+    pred_rewards = []
+    pred_done_logits = []
+    current_obs = seq["initial_obs"]
+    hidden = model.initial_state(current_obs.shape[0], current_obs.device)
+    for t in range(cfg.rollout_horizon):
+        hidden, pred = model.step(current_obs, seq["actions"][:, t], hidden)
+        current_obs = pred["pred_next_obs"]
+        pred_obs.append(current_obs)
+        pred_rewards.append(pred["pred_reward"])
+        pred_done_logits.append(pred["pred_done_logit"])
+    return {"next_obs": torch.stack(pred_obs, dim=1), "reward": torch.stack(pred_rewards, dim=1), "done_logit": torch.stack(pred_done_logits, dim=1)}
 
 
 def sequence_loss_from_predictions(pred: Dict[str, torch.Tensor], seq: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -225,6 +228,26 @@ def sequence_loss_sef(model: UniversalWorldModel, seq: Dict[str, torch.Tensor], 
 
 def sequence_loss_mlp(model: MLPWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     return sequence_loss_from_predictions(rollout_predict_mlp(model, seq, cfg), seq)
+
+
+def sequence_loss_gru(model: GRUWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    return sequence_loss_from_predictions(rollout_predict_gru(model, seq, cfg), seq)
+
+
+def predictions_for_label(model, label: str, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Dict[str, torch.Tensor]:
+    if label.startswith("sef"):
+        return rollout_predict_sef(model, seq, cfg)
+    if label.startswith("gru"):
+        return rollout_predict_gru(model, seq, cfg)
+    return rollout_predict_mlp(model, seq, cfg)
+
+
+def loss_for_label(model, label: str, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    if label.startswith("sef"):
+        return sequence_loss_sef(model, seq, cfg)
+    if label.startswith("gru"):
+        return sequence_loss_gru(model, seq, cfg)
+    return sequence_loss_mlp(model, seq, cfg)
 
 
 def _binary_accuracy(pred: torch.Tensor, target: torch.Tensor) -> float:
@@ -281,17 +304,14 @@ def evaluate_memory_keydoor(model, label: str, cfg: MemoryKeyDoorConfig) -> Dict
     event_values: Dict[str, List[float]] = {}
     for _ in range(cfg.eval_batches):
         seq = env.sample_sequence(cfg.batch_size, cfg.rollout_horizon, device)
-        if label.startswith("sef"):
-            pred = rollout_predict_sef(model, seq, cfg)
-        else:
-            pred = rollout_predict_mlp(model, seq, cfg)
+        pred = predictions_for_label(model, label, seq, cfg)
         _, metrics = sequence_loss_from_predictions(pred, seq)
         events = event_metrics_from_predictions(pred, seq, cfg)
         obs_values.append(float(metrics["obs_mse"].item()))
         reward_values.append(float(metrics["reward_mse"].item()))
         done_values.append(float(metrics["done_bce"].item()))
         for key, value in events.items():
-            if value == value:  # skip NaN batches for rare-event recall averages
+            if value == value:
                 event_values.setdefault(key, []).append(value)
     row = {
         "model": label,
@@ -314,11 +334,9 @@ def train_memory_keydoor(cfg: MemoryKeyDoorConfig):
         WorldModelConfig(max_obs_dim=cfg.max_obs_dim, latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim, num_actions=cfg.num_actions)
     ).to(device)
     mlp = MLPWorldModel(MLPWorldModelConfig(max_obs_dim=cfg.max_obs_dim, hidden_dim=cfg.hidden_dim, num_actions=cfg.num_actions)).to(device)
-    optimizers = {
-        "sef_gram_memory": torch.optim.AdamW(sef.parameters(), lr=cfg.lr, weight_decay=1e-4),
-        "mlp_memory": torch.optim.AdamW(mlp.parameters(), lr=cfg.lr, weight_decay=1e-4),
-    }
-    models = {"sef_gram_memory": sef, "mlp_memory": mlp}
+    gru = GRUWorldModel(GRUWorldModelConfig(max_obs_dim=cfg.max_obs_dim, hidden_dim=cfg.hidden_dim, num_actions=cfg.num_actions)).to(device)
+    models = {"sef_gram_memory": sef, "gru_memory": gru, "mlp_memory": mlp}
+    optimizers = {label: torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4) for label, model in models.items()}
 
     for label, model in models.items():
         print(f"[{label}] train steps={cfg.steps} batch={cfg.batch_size} horizon={cfg.rollout_horizon} device={device}")
@@ -327,10 +345,7 @@ def train_memory_keydoor(cfg: MemoryKeyDoorConfig):
             seq = env.sample_sequence(cfg.batch_size, cfg.rollout_horizon, device)
             model.train()
             optimizer.zero_grad()
-            if label.startswith("sef"):
-                loss, metrics = sequence_loss_sef(model, seq, cfg)
-            else:
-                loss, metrics = sequence_loss_mlp(model, seq, cfg)
+            loss, metrics = loss_for_label(model, label, seq, cfg)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
