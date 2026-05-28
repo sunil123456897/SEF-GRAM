@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List
 
 import torch
 
@@ -51,6 +51,85 @@ class GridWorldBatcher:
             reward = 1.0 if done else -0.01
             obs.append([ax / (n - 1), ay / (n - 1), gx / (n - 1), gy / (n - 1)])
             next_obs.append([nx / (n - 1), ny / (n - 1), gx / (n - 1), gy / (n - 1)])
+            actions.append(action)
+            rewards.append(reward)
+            dones.append(done)
+        return WorldBatch(
+            obs=pad_obs(torch.tensor(obs, dtype=torch.float32, device=device), self.spec.max_obs_dim),
+            actions=torch.tensor(actions, dtype=torch.long, device=device),
+            next_obs=pad_obs(torch.tensor(next_obs, dtype=torch.float32, device=device), self.spec.max_obs_dim),
+            rewards=torch.tensor(rewards, dtype=torch.float32, device=device),
+            dones=torch.tensor(dones, dtype=torch.float32, device=device),
+        )
+
+
+@dataclass
+class KeyDoorGridWorldSpec:
+    size: int = 6
+    max_obs_dim: int = 16
+
+
+class KeyDoorGridWorldBatcher:
+    """Key-door gridworld transition generator.
+
+    Observation layout before padding:
+    [agent_x, agent_y, key_x, key_y, door_x, door_y, goal_x, goal_y, has_key].
+    The door blocks movement until the key has been collected. This creates a
+    simple causal state variable (`has_key`) and a stronger reward/constraint signal
+    than plain GridWorld.
+    """
+
+    def __init__(self, spec: KeyDoorGridWorldSpec):
+        self.spec = spec
+
+    def sample(self, batch_size: int, device: torch.device) -> WorldBatch:
+        n = self.spec.size
+        obs = []
+        actions = []
+        next_obs = []
+        rewards = []
+        dones = []
+        for _ in range(batch_size):
+            ax, ay = random.randrange(n), random.randrange(n)
+            kx, ky = random.randrange(n), random.randrange(n)
+            dx, dy = random.randrange(n), random.randrange(n)
+            gx, gy = random.randrange(n), random.randrange(n)
+            has_key = random.choice([0, 1])
+            action = random.randrange(4)
+
+            nx, ny = ax, ay
+            if action == 0:
+                ny = max(0, ay - 1)
+            elif action == 1:
+                ny = min(n - 1, ay + 1)
+            elif action == 2:
+                nx = max(0, ax - 1)
+            elif action == 3:
+                nx = min(n - 1, ax + 1)
+
+            blocked_by_door = (nx == dx and ny == dy and has_key == 0)
+            if blocked_by_door:
+                nx, ny = ax, ay
+
+            next_has_key = int(has_key or (nx == kx and ny == ky))
+            done = float(next_has_key == 1 and nx == gx and ny == gy)
+            if done:
+                reward = 1.0
+            elif has_key == 0 and next_has_key == 1:
+                reward = 0.2
+            elif blocked_by_door:
+                reward = -0.1
+            else:
+                reward = -0.02
+
+            obs.append([
+                ax / (n - 1), ay / (n - 1), kx / (n - 1), ky / (n - 1),
+                dx / (n - 1), dy / (n - 1), gx / (n - 1), gy / (n - 1), float(has_key),
+            ])
+            next_obs.append([
+                nx / (n - 1), ny / (n - 1), kx / (n - 1), ky / (n - 1),
+                dx / (n - 1), dy / (n - 1), gx / (n - 1), gy / (n - 1), float(next_has_key),
+            ])
             actions.append(action)
             rewards.append(reward)
             dones.append(done)
@@ -113,7 +192,7 @@ class LinePhysicsBatcher:
 
 
 class MixedWorldBatcher:
-    """Mixture of simple environments sharing the same WorldBatch API."""
+    """Mixture of environments sharing the same WorldBatch API."""
 
     def __init__(self, batchers: List[object]):
         if not batchers:
@@ -129,6 +208,7 @@ def build_default_mixed_batcher(max_obs_dim: int = 16) -> MixedWorldBatcher:
     return MixedWorldBatcher(
         [
             GridWorldBatcher(GridWorldSpec(max_obs_dim=max_obs_dim)),
+            KeyDoorGridWorldBatcher(KeyDoorGridWorldSpec(max_obs_dim=max_obs_dim)),
             LinePhysicsBatcher(LinePhysicsSpec(max_obs_dim=max_obs_dim)),
         ]
     )
