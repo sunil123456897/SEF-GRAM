@@ -14,6 +14,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from sef_gram.optimization import MuonWithAuxAdam
 from sef_gram.world_baselines import GRUWorldModel, GRUWorldModelConfig, MLPWorldModel, MLPWorldModelConfig
 from sef_gram.world_model import UniversalWorldModel, WorldBatch, WorldModelConfig, pad_obs
 
@@ -336,7 +337,20 @@ def train_memory_keydoor(cfg: MemoryKeyDoorConfig):
     mlp = MLPWorldModel(MLPWorldModelConfig(max_obs_dim=cfg.max_obs_dim, hidden_dim=cfg.hidden_dim, num_actions=cfg.num_actions)).to(device)
     gru = GRUWorldModel(GRUWorldModelConfig(max_obs_dim=cfg.max_obs_dim, hidden_dim=cfg.hidden_dim, num_actions=cfg.num_actions)).to(device)
     models = {"sef_gram_memory": sef, "gru_memory": gru, "mlp_memory": mlp}
-    optimizers = {label: torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4) for label, model in models.items()}
+    optimizers = {}
+    for label, model in models.items():
+        if label.startswith("sef") or label.startswith("gru"):
+            optimizers[label] = MuonWithAuxAdam(
+                model.parameters(),
+                lr=0.02,
+                momentum=0.95,
+                ns_steps=5,
+                adamw_lr=cfg.lr,
+                adamw_betas=(0.9, 0.95),
+                adamw_wd=1e-4,
+            )
+        else:
+            optimizers[label] = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
 
     for label, model in models.items():
         print(f"[{label}] train steps={cfg.steps} batch={cfg.batch_size} horizon={cfg.rollout_horizon} device={device}")

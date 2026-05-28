@@ -1,5 +1,14 @@
+import sys
+from pathlib import Path
+
 import pytest
 import torch
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_LEGACY = _PROJECT_ROOT / "legacy"
+if str(_LEGACY) not in sys.path:
+    sys.path.insert(0, str(_LEGACY))
+
 from sef_gram.tokenizer import CharacterTokenizer
 from experiment_terminal_memory import (
     EFLACharacterModel,

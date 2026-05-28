@@ -12,6 +12,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from sef_gram.optimization import MuonWithAuxAdam
 from sef_gram.world_envs import build_default_mixed_batcher
 from sef_gram.world_model import UniversalWorldModel, WorldModelConfig
 
@@ -41,7 +42,15 @@ def train(cfg: TrainConfig) -> Dict[str, float]:
             num_actions=cfg.num_actions,
         )
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    optimizer = MuonWithAuxAdam(
+        model.parameters(),
+        lr=0.02,
+        momentum=0.95,
+        ns_steps=5,
+        adamw_lr=cfg.lr,
+        adamw_betas=(0.9, 0.95),
+        adamw_wd=1e-4,
+    )
 
     print(f"UniversalWorldModel training | steps={cfg.steps} batch={cfg.batch_size} device={device}")
     last_metrics: Dict[str, float] = {}
@@ -56,12 +65,14 @@ def train(cfg: TrainConfig) -> Dict[str, float]:
 
         last_metrics = {key: float(value.item()) for key, value in metrics.items()}
         if step == 1 or step % max(1, cfg.steps // 10) == 0:
+            de = last_metrics.get("dirichlet_energy", -1.0)
             print(
                 f"step={step:04d} total={last_metrics['total']:.4f} "
                 f"latent_mse={last_metrics['latent_mse']:.4f} "
                 f"obs={last_metrics['obs_mse']:.4f} "
                 f"reward={last_metrics['reward_mse']:.4f} "
-                f"done={last_metrics['done_bce']:.4f}"
+                f"done={last_metrics['done_bce']:.4f} "
+                f"E_Dirichlet={de:.4f}"
             )
     return last_metrics
 

@@ -141,6 +141,7 @@ class ActionConditionedTransition(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.action_embedding = nn.Embedding(cfg.num_actions, cfg.latent_dim)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=cfg.latent_dim, num_heads=4, batch_first=True)
         self.pre = nn.Sequential(
             nn.Linear(cfg.latent_dim * 2, cfg.hidden_dim),
             nn.SiLU(),
@@ -151,8 +152,14 @@ class ActionConditionedTransition(nn.Module):
         self.prior_mu = nn.Linear(cfg.latent_dim, cfg.latent_dim)
         self.prior_logvar = nn.Linear(cfg.latent_dim, cfg.latent_dim)
 
-    def forward(self, z: Tensor, action_ids: Tensor, memory: Tensor) -> Dict[str, Tensor]:
-        action_vec = self.action_embedding(action_ids.long())
+    def forward(self, z: Tensor, action_ids: Tensor, memory: Tensor, task_emb: Optional[Tensor] = None) -> Dict[str, Tensor]:
+        if task_emb is not None:
+            z_q = z.unsqueeze(1)
+            action_vec, _ = self.cross_attn(query=z_q, key=task_emb, value=task_emb)
+            action_vec = action_vec.squeeze(1)
+            z = z + action_vec
+        else:
+            action_vec = self.action_embedding(action_ids.long())
         z_action = self.pre(torch.cat([z, action_vec], dim=-1))
         z_next, memory_next = self.cell(z_action, memory)
         return {

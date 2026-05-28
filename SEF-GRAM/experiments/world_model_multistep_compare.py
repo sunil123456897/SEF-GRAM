@@ -16,6 +16,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from experiments.world_model_rollout_eval import evaluate_true_rollout
 from experiments.world_model_multistep_train import multi_env_rollout_loss
+from sef_gram.optimization import MuonWithAuxAdam
 from sef_gram.world_baselines import MLPWorldModel, MLPWorldModelConfig
 from sef_gram.world_envs import build_default_mixed_batcher
 from sef_gram.world_model import UniversalWorldModel, WorldModelConfig
@@ -61,7 +62,18 @@ def build_models(cfg: MultiStepCompareConfig, device: torch.device) -> List[Tupl
 def train_with_multistep_loss(model: nn.Module, cfg: MultiStepCompareConfig, label: str) -> None:
     device = torch.device(cfg.device)
     batcher = build_default_mixed_batcher(max_obs_dim=cfg.max_obs_dim)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    if label.startswith("sef"):
+        optimizer = MuonWithAuxAdam(
+            model.parameters(),
+            lr=0.02,
+            momentum=0.95,
+            ns_steps=5,
+            adamw_lr=cfg.lr,
+            adamw_betas=(0.9, 0.95),
+            adamw_wd=1e-4,
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
 
     print(
         f"[{label}] train steps={cfg.steps} batch={cfg.batch_size} "
@@ -79,12 +91,14 @@ def train_with_multistep_loss(model: nn.Module, cfg: MultiStepCompareConfig, lab
         optimizer.step()
 
         if step == 1 or step % max(1, cfg.steps // 5) == 0:
+            de = one_step_metrics.get("dirichlet_energy", torch.tensor(-1.0))
             print(
                 f"[{label}] step={step:04d} total={float(total.item()):.4f} "
                 f"one={float(one_step_metrics['total'].item()):.4f} "
                 f"rollout={float(rollout_metrics['rollout_total'].item()):.4f} "
                 f"roll_obs={float(rollout_metrics['rollout_obs_mse'].item()):.4f} "
-                f"roll_reward={float(rollout_metrics['rollout_reward_mse'].item()):.4f}"
+                f"roll_reward={float(rollout_metrics['rollout_reward_mse'].item()):.4f} "
+                f"E_Dirichlet={float(de.item()):.4f}"
             )
 
 

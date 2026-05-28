@@ -14,6 +14,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from sef_gram.optimization import MuonWithAuxAdam
 from sef_gram.world_baselines import MLPWorldModel, MLPWorldModelConfig
 from sef_gram.world_envs import build_default_mixed_batcher
 from sef_gram.world_model import UniversalWorldModel, WorldBatch, WorldModelConfig
@@ -43,7 +44,18 @@ class EvalConfig:
 def train_model(model: nn.Module, cfg: EvalConfig, label: str) -> None:
     device = torch.device(cfg.device)
     batcher = build_default_mixed_batcher(max_obs_dim=cfg.max_obs_dim)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    if isinstance(model, UniversalWorldModel):
+        optimizer = MuonWithAuxAdam(
+            model.parameters(),
+            lr=0.02,
+            momentum=0.95,
+            ns_steps=5,
+            adamw_lr=cfg.lr,
+            adamw_betas=(0.9, 0.95),
+            adamw_wd=1e-4,
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     print(f"[{label}] train steps={cfg.steps} batch={cfg.batch_size} device={device}")
     for step in range(1, cfg.steps + 1):
         batch = batcher.sample(cfg.batch_size, device)
@@ -58,7 +70,8 @@ def train_model(model: nn.Module, cfg: EvalConfig, label: str) -> None:
             obs = float(metrics["obs_mse"].item())
             reward = float(metrics["reward_mse"].item())
             done = float(metrics["done_bce"].item())
-            print(f"[{label}] step={step:04d} total={total:.4f} obs={obs:.4f} reward={reward:.4f} done={done:.4f}")
+            de = float(metrics.get("dirichlet_energy", -1.0))
+            print(f"[{label}] step={step:04d} total={total:.4f} obs={obs:.4f} reward={reward:.4f} done={done:.4f} E_Dirichlet={de:.4f}")
 
 
 @torch.no_grad()

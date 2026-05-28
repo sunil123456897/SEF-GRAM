@@ -38,6 +38,9 @@ class PlanningConfig:
     key_distance_weight: float = 1.0
     goal_distance_weight: float = 2.0
     force_no_key_start: bool = True
+    use_cem: bool = False
+    cem_iterations: int = 4
+    cem_elite_frac: float = 0.25
     export_csv: str = ""
 
 
@@ -161,7 +164,7 @@ def score_candidates_sef(model: UniversalWorldModel, initial_obs: torch.Tensor, 
         score = score + pred["reward"] + _geometry_progress_score(flat_obs, pred_next_obs, cfg)
         max_done = torch.maximum(max_done, done_prob)
         max_key = torch.maximum(max_key, key_prob)
-    score = score + cfg.done_bonus * max_done + cfg.key_bonus * max_key
+    score = score + pred["value"] + cfg.done_bonus * max_done + cfg.key_bonus * max_key
     return score.view(batch_size, num_candidates)
 
 
@@ -223,6 +226,48 @@ def score_candidates(model, label: str, initial_obs: torch.Tensor, candidates: t
     raise ValueError(f"unknown model label: {label}")
 
 
+def cem_plan(
+    model, label: str, initial_obs: torch.Tensor, cfg: PlanningConfig
+) -> torch.Tensor:
+    """CEM planning: iteratively refine candidates using world-model scoring.
+
+    1. Generate random candidates
+    2. Score → keep elite → perturb elites → repeat
+    3. Return best candidate per batch item
+    """
+    B = initial_obs.shape[0]
+    H = cfg.plan_horizon
+    device = initial_obs.device
+
+    candidates = torch.randint(0, cfg.num_actions, (B, cfg.num_candidates, H), device=device)
+
+    n_elite = max(1, int(cfg.num_candidates * cfg.cem_elite_frac))
+    n_new = cfg.num_candidates - n_elite
+
+    for iteration in range(cfg.cem_iterations):
+        scores = score_candidates(model, label, initial_obs, candidates, cfg)
+
+        _, elite_idx = scores.topk(n_elite, dim=1)
+        elite = torch.gather(candidates, 1, elite_idx.unsqueeze(-1).expand(-1, -1, H))
+
+        noise_level = max(0.1, 1.0 - iteration / cfg.cem_iterations)
+        noise_mask = torch.rand(B, n_new, H, device=device) < noise_level
+
+        new_random = torch.randint(0, cfg.num_actions, (B, n_new, H), device=device)
+
+        elite_tiled = elite[:, :n_new, :]
+        if n_new > n_elite:
+            repeats = (n_new + n_elite - 1) // n_elite
+            elite_tiled = elite.repeat(1, repeats, 1)[:, :n_new, :]
+
+        new_candidates = torch.where(noise_mask, new_random, elite_tiled)
+        candidates = torch.cat([elite, new_candidates], dim=1)
+
+    scores = score_candidates(model, label, initial_obs, candidates, cfg)
+    best_idx = scores.argmax(dim=1)
+    return candidates[torch.arange(B, device=device), best_idx]
+
+
 def execute_action_sequences(env: MemoryKeyDoorSequenceEnv, state: Dict[str, torch.Tensor], actions: torch.Tensor) -> Dict[str, torch.Tensor]:
     total_reward = torch.zeros(actions.shape[0], device=actions.device)
     ever_done = torch.zeros(actions.shape[0], device=actions.device)
@@ -281,9 +326,12 @@ def evaluate_planning(models: Dict[str, object], cfg: PlanningConfig) -> List[Di
             accum["oracle_candidate"][key].append(float(oracle_result[value].mean().item()))
 
         for label, model in models.items():
-            scores = score_candidates(model, label, initial_obs, candidates, cfg)
-            best_idx = scores.argmax(dim=1)
-            best_actions = candidates[torch.arange(cfg.batch_size, device=device), best_idx]
+            if cfg.use_cem:
+                best_actions = cem_plan(model, label, initial_obs, cfg)
+            else:
+                scores = score_candidates(model, label, initial_obs, candidates, cfg)
+                best_idx = scores.argmax(dim=1)
+                best_actions = candidates[torch.arange(cfg.batch_size, device=device), best_idx]
             result = execute_action_sequences(env, state, best_actions)
             for key, value in (("success_rate", "success"), ("key_rate", "has_key"), ("avg_total_reward", "total_reward"), ("avg_blocked_count", "blocked_count")):
                 accum[label][key].append(float(result[value].mean().item()))
@@ -350,6 +398,9 @@ def parse_args() -> PlanningConfig:
     parser.add_argument("--key-distance-weight", type=float, default=1.0)
     parser.add_argument("--goal-distance-weight", type=float, default=2.0)
     parser.add_argument("--allow-key-start", action="store_true")
+    parser.add_argument("--use-cem", action="store_true")
+    parser.add_argument("--cem-iterations", type=int, default=4)
+    parser.add_argument("--cem-elite-frac", type=float, default=0.25)
     parser.add_argument("--export-csv", type=str, default="")
     args = parser.parse_args()
     return PlanningConfig(
@@ -371,6 +422,9 @@ def parse_args() -> PlanningConfig:
         key_distance_weight=args.key_distance_weight,
         goal_distance_weight=args.goal_distance_weight,
         force_no_key_start=not args.allow_key_start,
+        use_cem=args.use_cem,
+        cem_iterations=args.cem_iterations,
+        cem_elite_frac=args.cem_elite_frac,
         export_csv=args.export_csv,
     )
 
