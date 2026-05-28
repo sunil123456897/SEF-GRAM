@@ -236,6 +236,7 @@ def run_all_ablations(args):
     
     seeds = [42, 100, 2026]
     results = []
+    raw_results = {}
     
     for mode_name, flags in modes:
         print(f"\nRunning ablation: {mode_name}...")
@@ -246,6 +247,7 @@ def run_all_ablations(args):
             "pixel_errs": [],
             "support_errs": []
         }
+        raw_results[mode_name] = {}
         
         for seed in seeds:
             print(f"  Seed {seed}...")
@@ -256,13 +258,26 @@ def run_all_ablations(args):
             metrics["pixel_errs"].append(res["query_pixel_error"])
             metrics["support_errs"].append(res["support_best_error"])
             
+            raw_results[mode_name][f"seed_{seed}"] = {
+                "ce_loss": res["final_ce_loss"],
+                "success_rate": res["success_rate"],
+                "pixel_acc": res["query_pixel_accuracy"],
+                "pixel_err": res["query_pixel_error"],
+                "support_err": res["support_best_error"]
+            }
+            
         results.append({
             "Mode": mode_name,
-            "Decoder CE": np.mean(metrics["ce_losses"]),
-            "Success Rate (%)": np.mean(metrics["success_rates"]),
-            "Query Pixel Acc (%)": np.mean(metrics["pixel_accs"]),
-            "Query Pixel Err": np.mean(metrics["pixel_errs"]),
-            "Support Best Err": np.mean(metrics["support_errs"])
+            "CE (Mean)": np.mean(metrics["ce_losses"]),
+            "CE (Std)": np.std(metrics["ce_losses"]),
+            "Succ (%) (Mean)": np.mean(metrics["success_rates"]),
+            "Succ (%) (Std)": np.std(metrics["success_rates"]),
+            "Pix Acc (%) (Mean)": np.mean(metrics["pixel_accs"]),
+            "Pix Acc (%) (Std)": np.std(metrics["pixel_accs"]),
+            "Pix Err (Mean)": np.mean(metrics["pixel_errs"]),
+            "Pix Err (Std)": np.std(metrics["pixel_errs"]),
+            "Supp Err (Mean)": np.mean(metrics["support_errs"]),
+            "Supp Err (Std)": np.std(metrics["support_errs"])
         })
         
     df = pd.DataFrame(results)
@@ -271,9 +286,9 @@ def run_all_ablations(args):
     os.makedirs("results", exist_ok=True)
     df.to_csv("results/phase7_ablations.csv", index=False)
     
-    # Save JSON
-    with open("results/phase7_ablations.json", "w") as f:
-        json.dump(results, f, indent=4)
+    # Save JSON with raw results
+    with open("results/phase7_ablations_raw.json", "w") as f:
+        json.dump(raw_results, f, indent=4)
         
     # Save Markdown
     os.makedirs("docs", exist_ok=True)
