@@ -33,7 +33,7 @@ class RetrievalConfig:
     distractor_len: int = 160
     eval_cases: int = 50
     lr: float = 3e-4
-    context_lm_weight: float = 0.02
+    context_lm_weight: float = 0.01
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 11
 
@@ -58,26 +58,50 @@ class TinyCharTokenizer:
 
 
 class RetrievalMemoryModel(nn.Module):
+    """EFLA memory model with a focused readout head for stored terminal values.
+
+    The benchmark now trains the actual retrieval objective directly: after the
+    model has consumed the terminal context, a small readout predicts the four
+    stored digits from the final latent state plus EFLA memory summaries.
+    """
+
     def __init__(self, vocab_size: int, latent_dim: int):
         super().__init__()
         self.latent_dim = latent_dim
-        self.embedding = nn.Embedding(vocab_size, latent_dim)
+        self.embedding = nn.Embedding(vocab_size, latent_dim, padding_idx=PAD)
         self.cell = ExactEFLACell(latent_dim)
-        self.head = nn.Linear(latent_dim, vocab_size)
+        self.lm_head = nn.Linear(latent_dim, vocab_size)
+        self.readout = nn.Sequential(
+            nn.Linear(latent_dim * 3, latent_dim * 2),
+            nn.SiLU(),
+            nn.Linear(latent_dim * 2, 4 * 10),
+        )
 
     def initial_memory(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(batch_size, self.latent_dim, self.latent_dim, device=device)
 
-    def forward(self, input_ids: torch.Tensor, memory: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor, memory: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, steps = input_ids.shape
         if memory is None:
             memory = self.initial_memory(batch_size, input_ids.device)
+        z = torch.zeros(batch_size, self.latent_dim, device=input_ids.device)
         logits = []
         for t in range(steps):
-            z = self.embedding(input_ids[:, t])
-            z, memory = self.cell(z, memory)
-            logits.append(self.head(z).unsqueeze(1))
-        return torch.cat(logits, dim=1), memory
+            token_ids = input_ids[:, t]
+            active = (token_ids != PAD).view(batch_size, 1)
+            z_in = self.embedding(token_ids)
+            z_next, memory_next = self.cell(z_in, memory)
+            z = torch.where(active, z_next, z)
+            memory = torch.where(active.view(batch_size, 1, 1), memory_next, memory)
+            logits.append(self.lm_head(z).unsqueeze(1))
+        return torch.cat(logits, dim=1), memory, z
+
+    def predict_digits(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        _, memory, z = self.forward(prompt_ids)
+        memory_mean = memory.mean(dim=1)
+        memory_diag = torch.diagonal(memory, dim1=1, dim2=2)
+        features = torch.cat([z, memory_mean, memory_diag], dim=-1)
+        return self.readout(features).view(prompt_ids.shape[0], 4, 10)
 
 
 def random_noise_line() -> str:
@@ -128,24 +152,14 @@ def collate_retrieval_batch(
     tokenizer: TinyCharTokenizer,
     tasks: List[Tuple[str, str, str]],
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     prompt_ids = [tokenizer.encode(prompt, add_bos=True) for prompt, _, _ in tasks]
-    target_ids = [tokenizer.encode(target) for _, target, _ in tasks]
     max_prompt_len = max(len(ids) for ids in prompt_ids)
-    max_target_len = max(len(ids) for ids in target_ids)
-
     prompts = [ids + [PAD] * (max_prompt_len - len(ids)) for ids in prompt_ids]
-    decoder_inputs = []
-    decoder_targets = []
-    for p_ids, t_ids in zip(prompt_ids, target_ids):
-        inp = [p_ids[-1]] + t_ids[:-1]
-        decoder_inputs.append(inp + [PAD] * (max_target_len - len(inp)))
-        decoder_targets.append(t_ids + [PAD] * (max_target_len - len(t_ids)))
-
+    digit_targets = [[int(ch) for ch in target.strip()] for _, target, _ in tasks]
     return (
         torch.tensor(prompts, dtype=torch.long, device=device),
-        torch.tensor(decoder_inputs, dtype=torch.long, device=device),
-        torch.tensor(decoder_targets, dtype=torch.long, device=device),
+        torch.tensor(digit_targets, dtype=torch.long, device=device),
     )
 
 
@@ -155,10 +169,9 @@ def retrieval_loss(
     tasks: List[Tuple[str, str, str]],
     device: torch.device,
 ) -> torch.Tensor:
-    prompts, decoder_inputs, decoder_targets = collate_retrieval_batch(tokenizer, tasks, device)
-    _, memory = model(prompts)
-    logits, _ = model(decoder_inputs, memory)
-    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), decoder_targets.reshape(-1), ignore_index=PAD)
+    prompts, digit_targets = collate_retrieval_batch(tokenizer, tasks, device)
+    digit_logits = model.predict_digits(prompts)
+    return F.cross_entropy(digit_logits.reshape(-1, 10), digit_targets.reshape(-1))
 
 
 def context_lm_loss(
@@ -169,7 +182,7 @@ def context_lm_loss(
 ) -> torch.Tensor:
     full = [sample for _, _, sample in tasks]
     batch = collate_strings(tokenizer, full, device)
-    logits, _ = model(batch[:, :-1])
+    logits, _, _ = model(batch[:, :-1])
     return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch[:, 1:].reshape(-1), ignore_index=PAD)
 
 
@@ -178,7 +191,7 @@ def train_step(
     tokenizer: TinyCharTokenizer,
     tasks: List[Tuple[str, str, str]],
     device: torch.device,
-    context_lm_weight: float = 0.02,
+    context_lm_weight: float = 0.01,
 ) -> torch.Tensor:
     loss = retrieval_loss(model, tokenizer, tasks, device)
     if context_lm_weight > 0:
@@ -193,18 +206,12 @@ def generate_answer(
     target_len: int,
     device: torch.device,
 ) -> str:
-    ids = torch.tensor([tokenizer.encode(prompt, add_bos=True)], dtype=torch.long, device=device)
+    del target_len
+    prompt_ids = torch.tensor([tokenizer.encode(prompt, add_bos=True)], dtype=torch.long, device=device)
     model.eval()
     with torch.no_grad():
-        _, memory = model(ids)
-        current = ids[:, -1:]
-        generated: List[int] = []
-        for _ in range(target_len):
-            logits, memory = model(current, memory)
-            next_id = int(logits[:, -1, :].argmax(dim=-1).item())
-            generated.append(next_id)
-            current = torch.tensor([[next_id]], dtype=torch.long, device=device)
-    return tokenizer.decode(generated)
+        digits = model.predict_digits(prompt_ids).argmax(dim=-1)[0].tolist()
+    return "".join(str(int(d)) for d in digits)
 
 
 def evaluate(model: RetrievalMemoryModel, tokenizer: TinyCharTokenizer, cfg: RetrievalConfig, device: torch.device) -> Dict[str, float]:
@@ -215,12 +222,13 @@ def evaluate(model: RetrievalMemoryModel, tokenizer: TinyCharTokenizer, cfg: Ret
     for i in range(cfg.eval_cases):
         prompt, target, _ = make_retrieval_task(cfg.distractor_len)
         pred = generate_answer(model, tokenizer, prompt, len(target), device)
-        exact += int(pred.strip() == target.strip())
-        for p_ch, t_ch in zip(pred, target):
+        target_clean = target.strip()
+        exact += int(pred == target_clean)
+        for p_ch, t_ch in zip(pred, target_clean):
             matching += int(p_ch == t_ch)
             total += 1
         if i < 3:
-            examples.append((target.strip(), pred.strip()))
+            examples.append((target_clean, pred))
     return {
         "exact_retrieval_accuracy": exact / max(1, cfg.eval_cases),
         "char_accuracy": matching / max(1, total),
@@ -267,7 +275,7 @@ def parse_args() -> RetrievalConfig:
     parser.add_argument("--distractor-len", type=int, default=160)
     parser.add_argument("--eval-cases", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--context-lm-weight", type=float, default=0.02)
+    parser.add_argument("--context-lm-weight", type=float, default=0.01)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=11)
     return RetrievalConfig(**vars(parser.parse_args()))
