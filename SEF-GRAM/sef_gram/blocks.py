@@ -22,6 +22,11 @@ class DiffusionBlocksTransformer(torch.nn.Module):
     Разделяет слои на B блоков.
     Реализует Stochastic Block Scheduling и EMA Coordinate Anchoring для
     полной стабилизации геометрии скрытых векторов и исключения координатного дрейфа.
+    
+    Примечание: Обучение поблочно (отключение requires_grad) экономит в первую
+    очередь память активаций и градиентов на Backward Pass (~2-3x экономия памяти).
+    Forward Pass для downstream блоков все равно выполняется, чтобы доставить
+    градиенты к активному блоку.
     """
     def __init__(self, latent_dim=512, num_blocks=3, layers_per_block=4):
         super().__init__()
@@ -72,10 +77,8 @@ class DiffusionBlocksTransformer(torch.nn.Module):
                           Если active_block_idx < 0, то используется стохастический выбор.
         """
         if active_block_idx < 0:
-            if not hasattr(self, 'current_active_block'):
-                self.set_active_block(-1)
+            self.set_active_block(-1)
             active_block_idx = self.current_active_block
-            
         out = x
         for b_idx, block in enumerate(self.blocks):
             if b_idx < active_block_idx:

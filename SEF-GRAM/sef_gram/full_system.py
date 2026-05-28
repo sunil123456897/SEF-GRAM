@@ -29,6 +29,7 @@ class SEFGRAMConfig:
     reward_names: Tuple[str, ...] = ("correctness", "format", "brevity")
     min_logvar: float = -8.0
     max_logvar: float = 4.0
+    use_efla: bool = True
 
 
 def reparameterize(mu: Tensor, logvar: Tensor, sample: bool = True) -> Tensor:
@@ -148,7 +149,10 @@ class ActionConditionedTransition(nn.Module):
             nn.Linear(cfg.hidden_dim, cfg.latent_dim),
             nn.LayerNorm(cfg.latent_dim),
         )
-        self.cell = ExactEFLACell(cfg.latent_dim)
+        if cfg.use_efla:
+            self.cell = ExactEFLACell(cfg.latent_dim)
+        else:
+            self.cell = nn.GRUCell(cfg.latent_dim, cfg.latent_dim * cfg.latent_dim)
         self.prior_mu = nn.Linear(cfg.latent_dim, cfg.latent_dim)
         self.prior_logvar = nn.Linear(cfg.latent_dim, cfg.latent_dim)
 
@@ -161,7 +165,18 @@ class ActionConditionedTransition(nn.Module):
         else:
             action_vec = self.action_embedding(action_ids.long())
         z_action = self.pre(torch.cat([z, action_vec], dim=-1))
-        z_next, memory_next = self.cell(z_action, memory)
+        
+        if self.cfg.use_efla:
+            z_next, memory_next = self.cell(z_action, memory)
+        else:
+            # Flatten memory for GRU
+            B = memory.shape[0]
+            flat_mem = memory.reshape(B, -1)
+            next_flat_mem = self.cell(z_action, flat_mem)
+            memory_next = next_flat_mem.reshape(B, self.cfg.latent_dim, self.cfg.latent_dim)
+            # Derive z_next from memory
+            z_next = memory_next.mean(dim=-1) # simple projection
+            
         return {
             "z_next": z_next,
             "memory_next": memory_next,
