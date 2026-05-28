@@ -164,6 +164,18 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
                     best_z_rule = z_cand
                     
             final_z_rule = valid_z_rules[0] if len(valid_z_rules) > 0 else best_z_rule
+        else:
+            z_cand_exp = final_z_rule.expand(K_supp, -1, -1)
+            with torch.no_grad():
+                z = model.core.encode_context(s_obs_enc_sq, sample=False)["z"]
+                memory = model.core.initial_memory(K_supp, z.device)
+                step_dict = model.core.transition(z, torch.zeros(K_supp, dtype=torch.long), memory, task_emb=z_cand_exp)
+                z_next = step_dict["z_next"]
+                grid_logits = decoder(z_next.unsqueeze(1))
+                preds = grid_logits.argmax(dim=2).squeeze(1)
+                target_pixels = sn.squeeze(0)
+                errors = (preds != target_pixels).sum().item()
+            best_error = errors
             
         if use_decoder_ttft:
             opt_decoder_tt = torch.optim.Adam(decoder.parameters(), lr=0.01)
@@ -213,13 +225,15 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
     mean_query_pixel_accuracy = total_query_pixel_accuracy / eval_tasks
     mean_query_pixel_error = total_query_pixel_error / eval_tasks
     mean_support_best_error = total_support_best_error / eval_tasks
+    param_count = sum(p.numel() for p in model.parameters())
     
     return {
         "final_ce_loss": final_ce_loss,
         "success_rate": success_rate,
         "query_pixel_accuracy": mean_query_pixel_accuracy,
         "query_pixel_error": mean_query_pixel_error,
-        "support_best_error": mean_support_best_error
+        "support_best_error": mean_support_best_error,
+        "param_count": param_count
     }
 
 def run_all_ablations(args):
@@ -268,6 +282,7 @@ def run_all_ablations(args):
             
         results.append({
             "Mode": mode_name,
+            "Params": res["param_count"],
             "CE (Mean)": np.mean(metrics["ce_losses"]),
             "CE (Std)": np.std(metrics["ce_losses"]),
             "Succ (%) (Mean)": np.mean(metrics["success_rates"]),
