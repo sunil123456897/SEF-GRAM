@@ -35,6 +35,8 @@ class PlanningConfig:
     seed: int = 43
     done_bonus: float = 3.0
     key_bonus: float = 0.5
+    key_distance_weight: float = 1.0
+    goal_distance_weight: float = 2.0
     force_no_key_start: bool = True
     export_csv: str = ""
 
@@ -124,6 +126,25 @@ def build_candidate_actions(initial_obs: torch.Tensor, cfg: PlanningConfig) -> t
     return candidates
 
 
+def _geometry_progress_score(flat_initial_obs: torch.Tensor, pred_next_obs: torch.Tensor, cfg: PlanningConfig) -> torch.Tensor:
+    """Dense planning score from predicted position and visible t=0 facts.
+
+    The learned model predicts future agent position and has_key. The planner is
+    allowed to use the visible initial key/goal facts to prefer plans that move
+    toward the key before pickup and toward the goal after pickup. This fixes the
+    previous sparse-score failure mode where reward/done logits alone could not
+    rank good candidates even when the candidate set contained them.
+    """
+
+    agent_xy = pred_next_obs[:, :2].clamp(0.0, 1.0)
+    key_xy = flat_initial_obs[:, 2:4].clamp(0.0, 1.0)
+    goal_xy = flat_initial_obs[:, 6:8].clamp(0.0, 1.0)
+    key_prob = pred_next_obs[:, 8].clamp(0.0, 1.0)
+    key_dist = (agent_xy - key_xy).abs().sum(dim=-1)
+    goal_dist = (agent_xy - goal_xy).abs().sum(dim=-1)
+    return -cfg.key_distance_weight * (1.0 - key_prob) * key_dist - cfg.goal_distance_weight * key_prob * goal_dist
+
+
 def score_candidates_sef(model: UniversalWorldModel, initial_obs: torch.Tensor, candidates: torch.Tensor, cfg: PlanningConfig) -> torch.Tensor:
     batch_size, num_candidates, horizon = candidates.shape
     flat_obs = initial_obs[:, None, :].expand(batch_size, num_candidates, cfg.max_obs_dim).reshape(batch_size * num_candidates, cfg.max_obs_dim)
@@ -134,9 +155,10 @@ def score_candidates_sef(model: UniversalWorldModel, initial_obs: torch.Tensor, 
     flat_actions = candidates.reshape(batch_size * num_candidates, horizon)
     for t in range(horizon):
         state, pred = model.stateful_step(state, flat_actions[:, t])
+        pred_next_obs = pred["next_obs"]
         done_prob = torch.sigmoid(pred["done_logit"])
-        key_prob = pred["next_obs"][:, 8].clamp(0.0, 1.0)
-        score = score + pred["reward"]
+        key_prob = pred_next_obs[:, 8].clamp(0.0, 1.0)
+        score = score + pred["reward"] + _geometry_progress_score(flat_obs, pred_next_obs, cfg)
         max_done = torch.maximum(max_done, done_prob)
         max_key = torch.maximum(max_key, key_prob)
     score = score + cfg.done_bonus * max_done + cfg.key_bonus * max_key
@@ -145,7 +167,8 @@ def score_candidates_sef(model: UniversalWorldModel, initial_obs: torch.Tensor, 
 
 def score_candidates_gru(model: GRUWorldModel, initial_obs: torch.Tensor, candidates: torch.Tensor, cfg: PlanningConfig) -> torch.Tensor:
     batch_size, num_candidates, horizon = candidates.shape
-    current_obs = initial_obs[:, None, :].expand(batch_size, num_candidates, cfg.max_obs_dim).reshape(batch_size * num_candidates, cfg.max_obs_dim)
+    flat_initial_obs = initial_obs[:, None, :].expand(batch_size, num_candidates, cfg.max_obs_dim).reshape(batch_size * num_candidates, cfg.max_obs_dim)
+    current_obs = flat_initial_obs
     hidden = model.initial_state(batch_size * num_candidates, initial_obs.device)
     score = torch.zeros(batch_size * num_candidates, device=initial_obs.device)
     max_done = torch.zeros_like(score)
@@ -156,7 +179,7 @@ def score_candidates_gru(model: GRUWorldModel, initial_obs: torch.Tensor, candid
         current_obs = pred["pred_next_obs"]
         done_prob = torch.sigmoid(pred["pred_done_logit"])
         key_prob = current_obs[:, 8].clamp(0.0, 1.0)
-        score = score + pred["pred_reward"]
+        score = score + pred["pred_reward"] + _geometry_progress_score(flat_initial_obs, current_obs, cfg)
         max_done = torch.maximum(max_done, done_prob)
         max_key = torch.maximum(max_key, key_prob)
     score = score + cfg.done_bonus * max_done + cfg.key_bonus * max_key
@@ -165,7 +188,8 @@ def score_candidates_gru(model: GRUWorldModel, initial_obs: torch.Tensor, candid
 
 def score_candidates_mlp(model: MLPWorldModel, initial_obs: torch.Tensor, candidates: torch.Tensor, cfg: PlanningConfig) -> torch.Tensor:
     batch_size, num_candidates, horizon = candidates.shape
-    current_obs = initial_obs[:, None, :].expand(batch_size, num_candidates, cfg.max_obs_dim).reshape(batch_size * num_candidates, cfg.max_obs_dim)
+    flat_initial_obs = initial_obs[:, None, :].expand(batch_size, num_candidates, cfg.max_obs_dim).reshape(batch_size * num_candidates, cfg.max_obs_dim)
+    current_obs = flat_initial_obs
     score = torch.zeros(batch_size * num_candidates, device=initial_obs.device)
     max_done = torch.zeros_like(score)
     max_key = torch.zeros_like(score)
@@ -182,7 +206,7 @@ def score_candidates_mlp(model: MLPWorldModel, initial_obs: torch.Tensor, candid
         current_obs = pred["pred_next_obs"]
         done_prob = torch.sigmoid(pred["pred_done_logit"])
         key_prob = current_obs[:, 8].clamp(0.0, 1.0)
-        score = score + pred["pred_reward"]
+        score = score + pred["pred_reward"] + _geometry_progress_score(flat_initial_obs, current_obs, cfg)
         max_done = torch.maximum(max_done, done_prob)
         max_key = torch.maximum(max_key, key_prob)
     score = score + cfg.done_bonus * max_done + cfg.key_bonus * max_key
@@ -323,6 +347,8 @@ def parse_args() -> PlanningConfig:
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--done-bonus", type=float, default=3.0)
     parser.add_argument("--key-bonus", type=float, default=0.5)
+    parser.add_argument("--key-distance-weight", type=float, default=1.0)
+    parser.add_argument("--goal-distance-weight", type=float, default=2.0)
     parser.add_argument("--allow-key-start", action="store_true")
     parser.add_argument("--export-csv", type=str, default="")
     args = parser.parse_args()
@@ -342,6 +368,8 @@ def parse_args() -> PlanningConfig:
         seed=args.seed,
         done_bonus=args.done_bonus,
         key_bonus=args.key_bonus,
+        key_distance_weight=args.key_distance_weight,
+        goal_distance_weight=args.goal_distance_weight,
         force_no_key_start=not args.allow_key_start,
         export_csv=args.export_csv,
     )
