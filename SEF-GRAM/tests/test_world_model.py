@@ -32,7 +32,7 @@ def test_universal_world_model_loss_backward():
     model = UniversalWorldModel(WorldModelConfig(max_obs_dim=16, latent_dim=16, hidden_dim=32, num_actions=4))
     loss, metrics = model.loss(batch)
     assert torch.isfinite(loss)
-    assert set(metrics) == {"total", "latent_nll", "kl", "obs_mse", "reward_mse", "done_bce"}
+    assert set(metrics) == {"total", "latent_mse", "latent_logvar_reg", "kl", "obs_mse", "reward_mse", "done_bce"}
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert grads
