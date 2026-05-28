@@ -135,6 +135,28 @@ class ExactEFLACell(nn.Module):
         return z_next, memory_next
 
 
+class GRUTransitionCell(nn.Module):
+    """A GRU baseline that maintains the same interface as ExactEFLACell.
+    
+    It flattens the NxN memory to a vector for standard GRU update,
+    and then reshapes it back.
+    """
+    
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.gru = nn.GRUCell(latent_dim, latent_dim * latent_dim)
+        
+    def forward(self, z_prev: Tensor, memory_prev: Tensor) -> Tuple[Tensor, Tensor]:
+        B = memory_prev.shape[0]
+        flat_mem = memory_prev.reshape(B, -1)
+        next_flat_mem = self.gru(z_prev, flat_mem)
+        memory_next = next_flat_mem.reshape(B, self.latent_dim, self.latent_dim)
+        # Derive z_next directly from the memory for consistency with EFLA
+        z_next = memory_next.mean(dim=-1)
+        return z_next, memory_next
+
+
 class ActionConditionedTransition(nn.Module):
     """Action-conditioned latent transition with EFLA memory dynamics."""
 
@@ -152,7 +174,7 @@ class ActionConditionedTransition(nn.Module):
         if cfg.use_efla:
             self.cell = ExactEFLACell(cfg.latent_dim)
         else:
-            self.cell = nn.GRUCell(cfg.latent_dim, cfg.latent_dim * cfg.latent_dim)
+            self.cell = GRUTransitionCell(cfg.latent_dim)
         self.prior_mu = nn.Linear(cfg.latent_dim, cfg.latent_dim)
         self.prior_logvar = nn.Linear(cfg.latent_dim, cfg.latent_dim)
 
@@ -166,16 +188,7 @@ class ActionConditionedTransition(nn.Module):
             action_vec = self.action_embedding(action_ids.long())
         z_action = self.pre(torch.cat([z, action_vec], dim=-1))
         
-        if self.cfg.use_efla:
-            z_next, memory_next = self.cell(z_action, memory)
-        else:
-            # Flatten memory for GRU
-            B = memory.shape[0]
-            flat_mem = memory.reshape(B, -1)
-            next_flat_mem = self.cell(z_action, flat_mem)
-            memory_next = next_flat_mem.reshape(B, self.cfg.latent_dim, self.cfg.latent_dim)
-            # Derive z_next from memory
-            z_next = memory_next.mean(dim=-1) # simple projection
+        z_next, memory_next = self.cell(z_action, memory)
             
         return {
             "z_next": z_next,

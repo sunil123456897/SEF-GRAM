@@ -6,6 +6,7 @@ import pandas as pd
 import json
 import os
 import copy
+import argparse
 
 from sef_gram.world_model import UniversalWorldModel, WorldModelConfig, WorldBatch
 from sef_gram.arc_dataset import ARCGridEncoder, ARCGridDecoder
@@ -49,13 +50,6 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
         orig_init(self, w_cfg)
         self.core.cfg.use_efla = use_efla
         self.ema_core.cfg.use_efla = use_efla
-        # Re-initialize the cell based on the override
-        if use_efla:
-            self.core.transition.cell = fs.ExactEFLACell(w_cfg.latent_dim)
-            self.ema_core.transition.cell = fs.ExactEFLACell(w_cfg.latent_dim)
-        else:
-            self.core.transition.cell = torch.nn.GRUCell(w_cfg.latent_dim, w_cfg.latent_dim * w_cfg.latent_dim)
-            self.ema_core.transition.cell = torch.nn.GRUCell(w_cfg.latent_dim, w_cfg.latent_dim * w_cfg.latent_dim)
     UniversalWorldModel.__init__ = patched_init
     
     model = UniversalWorldModel(cfg)
@@ -213,7 +207,7 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
     success_rate = (exact_match_count / eval_tasks) * 100
     return final_ce_loss, success_rate
 
-def run_all_ablations():
+def run_all_ablations(args):
     print("=== Phase 7: Scientific Ablation Studies ===")
     
     modes = [
@@ -226,24 +220,25 @@ def run_all_ablations():
     ]
     
     seeds = [42, 100, 2026]
-    
     results = []
     
     for mode_name, flags in modes:
-        print(f"\\nRunning ablation: {mode_name}...")
+        print(f"\nRunning ablation: {mode_name}...")
         mode_ce_losses = []
         mode_success_rates = []
         
         for seed in seeds:
             print(f"  Seed {seed}...")
-            ce_loss, success_rate = evaluate_mode(mode_name, flags, seed, eval_tasks=5, pretrain_steps=20)
+            ce_loss, success_rate = evaluate_mode(mode_name, flags, seed, eval_tasks=args.eval_tasks, pretrain_steps=args.pretrain_steps)
             mode_ce_losses.append(ce_loss)
             mode_success_rates.append(success_rate)
             
         results.append({
             "Mode": mode_name,
-            "Decoder CE": np.mean(mode_ce_losses),
-            "Success Rate (%)": np.mean(mode_success_rates)
+            "Decoder CE (Mean)": np.mean(mode_ce_losses),
+            "Decoder CE (Std)": np.std(mode_ce_losses),
+            "Success Rate (%) (Mean)": np.mean(mode_success_rates),
+            "Success Rate (%) (Std)": np.std(mode_success_rates)
         })
         
     df = pd.DataFrame(results)
@@ -260,12 +255,16 @@ def run_all_ablations():
     os.makedirs("docs", exist_ok=True)
     md_str = df.to_markdown(index=False, floatfmt=".2f")
     with open("docs/phase7_ablation_results.md", "w") as f:
-        f.write("# Phase 7: Component Ablations\\n\\n")
+        f.write("# Phase 7: Component Ablations\n\n")
         f.write(md_str)
-        f.write("\\n")
+        f.write("\n")
         
-    print("\\n=== Final Results ===")
+    print("\n=== Final Results ===")
     print(md_str)
 
 if __name__ == "__main__":
-    run_all_ablations()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--eval_tasks", type=int, default=5, help="Number of tasks for evaluation.")
+    parser.add_argument("--pretrain_steps", type=int, default=20, help="Number of pretraining steps.")
+    args = parser.parse_args()
+    run_all_ablations(args)
