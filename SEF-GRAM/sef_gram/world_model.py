@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from sef_gram.full_system import (
     SEFGRAMConfig,
     StochasticRecursiveWorldModel,
-    diagonal_gaussian_nll,
     diagonal_kl_to_standard_normal,
 )
 
@@ -56,6 +55,7 @@ class WorldModelConfig:
     obs_weight: float = 1.0
     reward_weight: float = 1.0
     done_weight: float = 0.2
+    logvar_weight: float = 1e-3
 
 
 def pad_obs(obs: Tensor, max_obs_dim: int) -> Tensor:
@@ -124,14 +124,21 @@ class UniversalWorldModel(nn.Module):
 
     def loss(self, batch: WorldBatch) -> Tuple[Tensor, Dict[str, Tensor]]:
         out = self.forward(batch)
-        latent_nll = diagonal_gaussian_nll(out["target_mu"], out["prior_mu"], out["prior_logvar"])
+
+        # Stable latent objective: Gaussian NLL can become strongly negative by
+        # collapsing log-variance to its clamp floor. For the Phase 2 MVP we use
+        # direct latent mean matching plus a tiny logvar regularizer so the total
+        # loss remains interpretable and bounded below by the reconstruction terms.
+        latent_mse = F.mse_loss(out["prior_mu"], out["target_mu"])
+        latent_logvar_reg = out["prior_logvar"].pow(2).mean()
         kl = diagonal_kl_to_standard_normal(out["context_mu"], out["context_logvar"])
         obs_mse = F.mse_loss(out["pred_next_obs"], out["target_next_obs"])
         reward_mse = F.mse_loss(out["pred_reward"], out["target_reward"])
         done_bce = F.binary_cross_entropy_with_logits(out["pred_done_logit"], out["target_done"])
 
         total = (
-            self.cfg.latent_weight * latent_nll
+            self.cfg.latent_weight * latent_mse
+            + self.cfg.logvar_weight * latent_logvar_reg
             + self.cfg.beta_kl * kl
             + self.cfg.obs_weight * obs_mse
             + self.cfg.reward_weight * reward_mse
@@ -139,7 +146,8 @@ class UniversalWorldModel(nn.Module):
         )
         metrics = {
             "total": total.detach(),
-            "latent_nll": latent_nll.detach(),
+            "latent_mse": latent_mse.detach(),
+            "latent_logvar_reg": latent_logvar_reg.detach(),
             "kl": kl.detach(),
             "obs_mse": obs_mse.detach(),
             "reward_mse": reward_mse.detach(),
