@@ -1,6 +1,14 @@
 import torch
 
-from sef_gram.world_envs import GridWorldBatcher, GridWorldSpec, LinePhysicsBatcher, LinePhysicsSpec, build_default_mixed_batcher
+from sef_gram.world_envs import (
+    GridWorldBatcher,
+    GridWorldSpec,
+    KeyDoorGridWorldBatcher,
+    KeyDoorGridWorldSpec,
+    LinePhysicsBatcher,
+    LinePhysicsSpec,
+    build_default_mixed_batcher,
+)
 from sef_gram.world_model import UniversalWorldModel, WorldModelConfig, pad_obs
 
 
@@ -15,9 +23,10 @@ def test_pad_obs():
 def test_world_env_batchers():
     device = torch.device("cpu")
     grid = GridWorldBatcher(GridWorldSpec(size=5, max_obs_dim=16)).sample(8, device)
+    key_door = KeyDoorGridWorldBatcher(KeyDoorGridWorldSpec(size=6, max_obs_dim=16)).sample(8, device)
     physics = LinePhysicsBatcher(LinePhysicsSpec(max_obs_dim=16)).sample(8, device)
     mixed = build_default_mixed_batcher(max_obs_dim=16).sample(8, device)
-    for batch in (grid, physics, mixed):
+    for batch in (grid, key_door, physics, mixed):
         assert batch.obs.shape == (8, 16)
         assert batch.next_obs.shape == (8, 16)
         assert batch.actions.shape == (8,)
