@@ -1,5 +1,12 @@
 import torch
 
+from experiments.ablation_suite import (
+    AblationConfig,
+    NeuralOnlyRetrievalModel,
+    evaluate_neural_retrieval,
+    mean_metrics,
+    neural_retrieval_train_step,
+)
 from experiments.full_nqueens_benchmark import (
     NQueensRunConfig,
     batch_from_solutions,
@@ -64,3 +71,18 @@ def test_terminal_retrieval_training_step():
     loss = retrieval_train_step(model, tokenizer, tasks, torch.device("cpu"), context_lm_weight=0.01)
     assert torch.isfinite(loss)
     loss.backward()
+
+
+def test_ablation_helpers_smoke():
+    torch.manual_seed(0)
+    cfg = AblationConfig(device="cpu", terminal_steps=1, terminal_batch_size=2, terminal_distractor_len=16, terminal_eval_cases=2, latent_dim=16)
+    tokenizer = RetrievalTokenizer()
+    model = NeuralOnlyRetrievalModel(tokenizer.vocab_size, cfg.latent_dim)
+    tasks = [make_retrieval_task(cfg.terminal_distractor_len) for _ in range(cfg.terminal_batch_size)]
+    loss = neural_retrieval_train_step(model, tokenizer, tasks, torch.device("cpu"))
+    assert torch.isfinite(loss)
+    loss.backward()
+    metrics = evaluate_neural_retrieval(model, tokenizer, cfg, torch.device("cpu"))
+    assert "exact_retrieval_accuracy" in metrics
+    averaged = mean_metrics([{"a": 1.0, "b": 2.0}, {"a": 3.0, "b": 4.0}])
+    assert averaged == {"a": 2.0, "b": 3.0}
