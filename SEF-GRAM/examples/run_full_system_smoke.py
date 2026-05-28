@@ -1,4 +1,18 @@
+from pathlib import Path
+import sys
+
 import torch
+
+
+# Allow direct execution from either the repository root or the SEF-GRAM/
+# project directory without requiring editable installation first.
+_THIS_FILE = Path(__file__).resolve()
+_PROJECT_ROOT = _THIS_FILE.parents[1]
+_REPO_ROOT = _THIS_FILE.parents[2] if len(_THIS_FILE.parents) > 2 else _PROJECT_ROOT
+for path in (_PROJECT_ROOT, _REPO_ROOT, _REPO_ROOT / "SEF-GRAM"):
+    path_str = str(path)
+    if path.exists() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from sef_gram.full_system import LatentPoEPlanner, SEFGRAMObjective, build_tiny_system
 
