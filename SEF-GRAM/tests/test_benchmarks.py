@@ -15,6 +15,13 @@ from experiments.terminal_echo_benchmark import (
     make_terminal_task,
     train_step,
 )
+from experiments.terminal_retrieval_benchmark import (
+    RetrievalConfig,
+    RetrievalMemoryModel,
+    TinyCharTokenizer as RetrievalTokenizer,
+    make_retrieval_task,
+    train_step as retrieval_train_step,
+)
 from sef_gram.full_system import SEFGRAMConfig, StochasticRecursiveWorldModel
 
 
@@ -44,5 +51,16 @@ def test_terminal_echo_training_step():
     model = EchoTerminalModel(tokenizer.vocab_size, cfg.latent_dim)
     samples = [make_terminal_task(cfg.distractor_len)[2] for _ in range(cfg.batch_size)]
     loss = train_step(model, tokenizer, samples, torch.device("cpu"))
+    assert torch.isfinite(loss)
+    loss.backward()
+
+
+def test_terminal_retrieval_training_step():
+    torch.manual_seed(0)
+    cfg = RetrievalConfig(latent_dim=16, batch_size=2, distractor_len=16, eval_cases=2, device="cpu")
+    tokenizer = RetrievalTokenizer()
+    model = RetrievalMemoryModel(tokenizer.vocab_size, cfg.latent_dim)
+    tasks = [make_retrieval_task(cfg.distractor_len) for _ in range(cfg.batch_size)]
+    loss = retrieval_train_step(model, tokenizer, tasks, torch.device("cpu"), context_lm_weight=0.01)
     assert torch.isfinite(loss)
     loss.backward()
