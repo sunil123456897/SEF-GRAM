@@ -4,10 +4,11 @@ from experiments.memory_keydoor_compare import (
     MemoryKeyDoorConfig,
     MemoryKeyDoorSequenceEnv,
     evaluate_memory_keydoor,
+    sequence_loss_gru,
     sequence_loss_mlp,
     sequence_loss_sef,
 )
-from sef_gram.world_baselines import MLPWorldModel, MLPWorldModelConfig
+from sef_gram.world_baselines import GRUWorldModel, GRUWorldModelConfig, MLPWorldModel, MLPWorldModelConfig
 from sef_gram.world_model import UniversalWorldModel, WorldModelConfig
 
 
@@ -39,6 +40,13 @@ def test_memory_keydoor_losses_backward():
     sef_loss.backward()
     assert [p.grad for p in sef.parameters() if p.grad is not None]
 
+    gru = GRUWorldModel(GRUWorldModelConfig(max_obs_dim=16, hidden_dim=32, num_actions=4))
+    gru_loss, gru_metrics = sequence_loss_gru(gru, seq, cfg)
+    assert torch.isfinite(gru_loss)
+    assert set(gru_metrics) == {"obs_mse", "reward_mse", "done_bce"}
+    gru_loss.backward()
+    assert [p.grad for p in gru.parameters() if p.grad is not None]
+
     mlp = MLPWorldModel(MLPWorldModelConfig(max_obs_dim=16, hidden_dim=32, num_actions=4))
     mlp_loss, mlp_metrics = sequence_loss_mlp(mlp, seq, cfg)
     assert torch.isfinite(mlp_loss)
@@ -55,3 +63,13 @@ def test_memory_keydoor_eval_smoke():
     assert row["model"] == "sef_gram_memory"
     assert row["env"] == "memory_key_door"
     assert "rollout_obs_mse_avg" in row
+
+
+def test_gru_memory_keydoor_eval_smoke():
+    torch.manual_seed(0)
+    cfg = MemoryKeyDoorConfig(batch_size=4, eval_batches=1, rollout_horizon=2, device="cpu", latent_dim=16, hidden_dim=32)
+    model = GRUWorldModel(GRUWorldModelConfig(max_obs_dim=16, hidden_dim=32, num_actions=4))
+    row = evaluate_memory_keydoor(model, "gru_memory", cfg)
+    assert row["model"] == "gru_memory"
+    assert row["env"] == "memory_key_door"
+    assert "has_key_accuracy" in row
