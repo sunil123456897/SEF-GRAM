@@ -58,8 +58,10 @@ def train(cfg: TrainConfig) -> Dict[str, float]:
         if step == 1 or step % max(1, cfg.steps // 10) == 0:
             print(
                 f"step={step:04d} total={last_metrics['total']:.4f} "
-                f"latent={last_metrics['latent_nll']:.4f} obs={last_metrics['obs_mse']:.4f} "
-                f"reward={last_metrics['reward_mse']:.4f} done={last_metrics['done_bce']:.4f}"
+                f"latent_mse={last_metrics['latent_mse']:.4f} "
+                f"obs={last_metrics['obs_mse']:.4f} "
+                f"reward={last_metrics['reward_mse']:.4f} "
+                f"done={last_metrics['done_bce']:.4f}"
             )
     return last_metrics
 
