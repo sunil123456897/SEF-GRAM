@@ -5,7 +5,7 @@ import argparse
 import csv
 import math
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, List, Tuple
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +18,7 @@ from experiments.memory_keydoor_compare import MemoryKeyDoorConfig, run as run_m
 @dataclass
 class MultiSeedMemoryConfig:
     seeds: Tuple[int, ...] = (37, 38, 39)
-    base: MemoryKeyDoorConfig = MemoryKeyDoorConfig()
+    base: MemoryKeyDoorConfig = field(default_factory=MemoryKeyDoorConfig)
     export_csv: str = ""
     export_raw_csv: str = ""
 
