@@ -70,6 +70,7 @@ class WorldModelConfig:
     attractor_weight: float = 1.0  # Weight for Discrete Attractor (Commitment Loss)
     ema_decay: float = 0.99
     block_size_k: int = 4  # Diffusion-GRAM active block size
+    use_efla: bool = True
 
 
 def pad_obs(obs: Tensor, max_obs_dim: int) -> Tensor:
@@ -100,6 +101,7 @@ class UniversalWorldModel(nn.Module):
                 recursion_depth=1,
                 num_trajectories=1,
                 reward_names=("reward",),
+                use_efla=cfg.use_efla,
             )
         )
         

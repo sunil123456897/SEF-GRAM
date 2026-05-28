@@ -30,7 +30,8 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
         hidden_dim=128,
         num_actions=4,
         env_vocab_size=11, 
-        block_size_k=1
+        block_size_k=1,
+        use_efla=config_flags.get("use_efla", True)
     )
     
     # Mode overrides
@@ -43,17 +44,7 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
     # ---------------------------------------------------------------------
     # 1. Pretraining
     # ---------------------------------------------------------------------
-    import sef_gram.full_system as fs
-    # Inject efla override into the SEFGRAMConfig inside UniversalWorldModel
-    orig_init = UniversalWorldModel.__init__
-    def patched_init(self, w_cfg):
-        orig_init(self, w_cfg)
-        self.core.cfg.use_efla = use_efla
-        self.ema_core.cfg.use_efla = use_efla
-    UniversalWorldModel.__init__ = patched_init
-    
     model = UniversalWorldModel(cfg)
-    UniversalWorldModel.__init__ = orig_init
     
     encoder = ARCGridEncoder(latent_dim, vocab_size=11)
     decoder = ARCGridDecoder(latent_dim, vocab_size=11)
@@ -110,6 +101,10 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
     task_encoder.eval()
     
     exact_match_count = 0
+    total_query_pixel_accuracy = 0.0
+    total_query_pixel_error = 0.0
+    total_support_best_error = 0.0
+    
     for task_idx in range(eval_tasks):
         decoder_state = {k: v.clone() for k, v in decoder.state_dict().items()}
         decoder.train()
@@ -137,6 +132,7 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
             z_rule_ttt = z_rule_amortized # [1, num_slots, dim]
             
         final_z_rule = z_rule_ttt[0:1] # Default (w/o Support Verifier), [1, num_slots, dim]
+        best_error = float('inf') # Default
         
         if use_verifier:
             valid_z_rules = []
@@ -199,13 +195,32 @@ def evaluate_mode(mode_name, config_flags, seed, eval_tasks=5, pretrain_steps=20
             pred_q = grid_logits_q.argmax(dim=2).squeeze(1).squeeze(0)
             target_q = qn.squeeze(0).squeeze(0)
             
-            if torch.all(pred_q == target_q):
+            pixels_correct = (pred_q == target_q).sum().item()
+            total_pixels = target_q.numel()
+            pixels_wrong = total_pixels - pixels_correct
+            
+            total_query_pixel_error += pixels_wrong
+            total_query_pixel_accuracy += (pixels_correct / total_pixels) * 100
+            
+            if pixels_wrong == 0:
                 exact_match_count += 1
+                
+        total_support_best_error += best_error if best_error != float('inf') else 900
                 
         decoder.load_state_dict(decoder_state)
 
     success_rate = (exact_match_count / eval_tasks) * 100
-    return final_ce_loss, success_rate
+    mean_query_pixel_accuracy = total_query_pixel_accuracy / eval_tasks
+    mean_query_pixel_error = total_query_pixel_error / eval_tasks
+    mean_support_best_error = total_support_best_error / eval_tasks
+    
+    return {
+        "final_ce_loss": final_ce_loss,
+        "success_rate": success_rate,
+        "query_pixel_accuracy": mean_query_pixel_accuracy,
+        "query_pixel_error": mean_query_pixel_error,
+        "support_best_error": mean_support_best_error
+    }
 
 def run_all_ablations(args):
     print("=== Phase 7: Scientific Ablation Studies ===")
@@ -224,21 +239,30 @@ def run_all_ablations(args):
     
     for mode_name, flags in modes:
         print(f"\nRunning ablation: {mode_name}...")
-        mode_ce_losses = []
-        mode_success_rates = []
+        metrics = {
+            "ce_losses": [],
+            "success_rates": [],
+            "pixel_accs": [],
+            "pixel_errs": [],
+            "support_errs": []
+        }
         
         for seed in seeds:
             print(f"  Seed {seed}...")
-            ce_loss, success_rate = evaluate_mode(mode_name, flags, seed, eval_tasks=args.eval_tasks, pretrain_steps=args.pretrain_steps)
-            mode_ce_losses.append(ce_loss)
-            mode_success_rates.append(success_rate)
+            res = evaluate_mode(mode_name, flags, seed, eval_tasks=args.eval_tasks, pretrain_steps=args.pretrain_steps)
+            metrics["ce_losses"].append(res["final_ce_loss"])
+            metrics["success_rates"].append(res["success_rate"])
+            metrics["pixel_accs"].append(res["query_pixel_accuracy"])
+            metrics["pixel_errs"].append(res["query_pixel_error"])
+            metrics["support_errs"].append(res["support_best_error"])
             
         results.append({
             "Mode": mode_name,
-            "Decoder CE (Mean)": np.mean(mode_ce_losses),
-            "Decoder CE (Std)": np.std(mode_ce_losses),
-            "Success Rate (%) (Mean)": np.mean(mode_success_rates),
-            "Success Rate (%) (Std)": np.std(mode_success_rates)
+            "Decoder CE": np.mean(metrics["ce_losses"]),
+            "Success Rate (%)": np.mean(metrics["success_rates"]),
+            "Query Pixel Acc (%)": np.mean(metrics["pixel_accs"]),
+            "Query Pixel Err": np.mean(metrics["pixel_errs"]),
+            "Support Best Err": np.mean(metrics["support_errs"])
         })
         
     df = pd.DataFrame(results)
