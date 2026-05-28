@@ -5,7 +5,7 @@ import argparse
 import csv
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 
@@ -39,25 +39,43 @@ class PlanningConfig:
     export_csv: str = ""
 
 
-def _path_actions(start_xy: torch.Tensor, target_xy: torch.Tensor, horizon: int, device: torch.device) -> torch.Tensor:
+def _path_action_list(start_xy: torch.Tensor, target_xy: torch.Tensor) -> List[int]:
+    """Shortest Manhattan action list without padding.
+
+    Actions: 0 up, 1 down, 2 left, 3 right.
+    """
+
     actions: List[int] = []
     x, y = int(start_xy[0].item()), int(start_xy[1].item())
     tx, ty = int(target_xy[0].item()), int(target_xy[1].item())
-    while x < tx and len(actions) < horizon:
+    while x < tx:
         actions.append(3)
         x += 1
-    while x > tx and len(actions) < horizon:
+    while x > tx:
         actions.append(2)
         x -= 1
-    while y < ty and len(actions) < horizon:
+    while y < ty:
         actions.append(1)
         y += 1
-    while y > ty and len(actions) < horizon:
+    while y > ty:
         actions.append(0)
         y -= 1
-    if len(actions) < horizon:
-        actions.extend([1] * (horizon - len(actions)))
-    return torch.tensor(actions[:horizon], dtype=torch.long, device=device)
+    return actions
+
+
+def _actions_tensor(actions: List[int], horizon: int, device: torch.device) -> torch.Tensor:
+    if len(actions) >= horizon:
+        return torch.tensor(actions[:horizon], dtype=torch.long, device=device)
+    # There is no no-op action in this toy environment. Random padding is safer
+    # than deterministic movement because success is measured as ever reached.
+    pad = torch.randint(0, 4, (horizon - len(actions),), dtype=torch.long, device=device)
+    if actions:
+        return torch.cat([torch.tensor(actions, dtype=torch.long, device=device), pad], dim=0)
+    return pad
+
+
+def _path_actions(start_xy: torch.Tensor, target_xy: torch.Tensor, horizon: int, device: torch.device) -> torch.Tensor:
+    return _actions_tensor(_path_action_list(start_xy, target_xy), horizon, device)
 
 
 def _decode_initial_positions(initial_obs: torch.Tensor, size: int) -> torch.Tensor:
@@ -66,10 +84,11 @@ def _decode_initial_positions(initial_obs: torch.Tensor, size: int) -> torch.Ten
 
 
 def build_candidate_actions(initial_obs: torch.Tensor, cfg: PlanningConfig) -> torch.Tensor:
-    """Build action candidates from random shooting plus simple visible-fact paths.
+    """Build action candidates from random shooting plus visible-fact path priors.
 
-    The environment exposes key/door/goal at t=0, so the planner is allowed to use
-    these facts to propose candidates. The learned model still scores candidates.
+    Candidate 0 is a deterministic key-then-goal path when it fits the horizon.
+    Earlier versions accidentally padded the key path before appending the goal path,
+    which made the planning benchmark much weaker than intended.
     """
 
     device = initial_obs.device
@@ -80,26 +99,28 @@ def build_candidate_actions(initial_obs: torch.Tensor, cfg: PlanningConfig) -> t
     for b in range(batch_size):
         agent = pos[b, 0:2]
         key = pos[b, 2:4]
+        door = pos[b, 4:6]
         goal = pos[b, 6:8]
+        key_then_goal = _path_action_list(agent, key) + _path_action_list(key, goal)
+        direct_goal = _path_action_list(agent, goal)
+        key_then_door = _path_action_list(agent, key) + _path_action_list(key, door)
+        door_then_goal = _path_action_list(agent, door) + _path_action_list(door, goal)
+
         if cfg.num_candidates >= 1:
-            to_key = _path_actions(agent, key, cfg.plan_horizon, device)
-            key_pos_after = key
-            remaining = max(0, cfg.plan_horizon - int((to_key != 1).numel()))
-            key_then_goal = torch.cat(
-                [
-                    _path_actions(agent, key, cfg.plan_horizon, device),
-                    _path_actions(key_pos_after, goal, cfg.plan_horizon, device),
-                ]
-            )[: cfg.plan_horizon]
-            candidates[b, 0] = key_then_goal
+            candidates[b, 0] = _actions_tensor(key_then_goal, cfg.plan_horizon, device)
         if cfg.num_candidates >= 2:
-            candidates[b, 1] = _path_actions(agent, goal, cfg.plan_horizon, device)
+            candidates[b, 1] = _actions_tensor(direct_goal, cfg.plan_horizon, device)
         if cfg.num_candidates >= 3:
-            path = _path_actions(agent, key, cfg.plan_horizon, device)
-            cut = min(cfg.plan_horizon, max(1, int((agent - key).abs().sum().item())))
+            candidates[b, 2] = _actions_tensor(key_then_door, cfg.plan_horizon, device)
+        if cfg.num_candidates >= 4:
+            candidates[b, 3] = _actions_tensor(door_then_goal, cfg.plan_horizon, device)
+        if cfg.num_candidates >= 5:
+            path = _path_action_list(agent, key)
             mixed = torch.randint(0, cfg.num_actions, (cfg.plan_horizon,), device=device)
-            mixed[:cut] = path[:cut]
-            candidates[b, 2] = mixed
+            cut = min(cfg.plan_horizon, len(path))
+            if cut > 0:
+                mixed[:cut] = torch.tensor(path[:cut], dtype=torch.long, device=device)
+            candidates[b, 4] = mixed
     return candidates
 
 
@@ -190,12 +211,22 @@ def execute_action_sequences(env: MemoryKeyDoorSequenceEnv, state: Dict[str, tor
         ever_done = torch.maximum(ever_done, done)
         ever_key = torch.maximum(ever_key, current_state["has_key"].float())
         blocked_count = blocked_count + events["blocked"]
-    return {
-        "total_reward": total_reward,
-        "success": ever_done,
-        "has_key": ever_key,
-        "blocked_count": blocked_count,
-    }
+    return {"total_reward": total_reward, "success": ever_done, "has_key": ever_key, "blocked_count": blocked_count}
+
+
+def _expand_state_for_candidates(state: Dict[str, torch.Tensor], num_candidates: int) -> Dict[str, torch.Tensor]:
+    return {key: value[:, None, ...].expand(value.shape[0], num_candidates, *value.shape[1:]).reshape(value.shape[0] * num_candidates, *value.shape[1:]) for key, value in state.items()}
+
+
+def oracle_select_candidates(env: MemoryKeyDoorSequenceEnv, state: Dict[str, torch.Tensor], candidates: torch.Tensor, cfg: PlanningConfig) -> Dict[str, torch.Tensor]:
+    batch_size, num_candidates, horizon = candidates.shape
+    flat_state = _expand_state_for_candidates(state, num_candidates)
+    flat_actions = candidates.reshape(batch_size * num_candidates, horizon)
+    flat_result = execute_action_sequences(env, flat_state, flat_actions)
+    true_score = flat_result["total_reward"] + cfg.done_bonus * flat_result["success"] + cfg.key_bonus * flat_result["has_key"]
+    best_idx = true_score.view(batch_size, num_candidates).argmax(dim=1)
+    best_actions = candidates[torch.arange(batch_size, device=candidates.device), best_idx]
+    return execute_action_sequences(env, state, best_actions)
 
 
 @torch.no_grad()
@@ -205,7 +236,7 @@ def evaluate_planning(models: Dict[str, object], cfg: PlanningConfig) -> List[Di
     env = MemoryKeyDoorSequenceEnv(size=cfg.size, max_obs_dim=cfg.max_obs_dim)
     accum: Dict[str, Dict[str, List[float]]] = {}
 
-    labels = ["random_policy"] + list(models.keys())
+    labels = ["random_policy", "oracle_candidate"] + list(models.keys())
     for label in labels:
         accum[label] = {"success_rate": [], "key_rate": [], "avg_total_reward": [], "avg_blocked_count": []}
 
@@ -218,20 +249,20 @@ def evaluate_planning(models: Dict[str, object], cfg: PlanningConfig) -> List[Di
 
         random_actions = torch.randint(0, cfg.num_actions, (cfg.batch_size, cfg.plan_horizon), device=device)
         random_result = execute_action_sequences(env, state, random_actions)
-        accum["random_policy"]["success_rate"].append(float(random_result["success"].mean().item()))
-        accum["random_policy"]["key_rate"].append(float(random_result["has_key"].mean().item()))
-        accum["random_policy"]["avg_total_reward"].append(float(random_result["total_reward"].mean().item()))
-        accum["random_policy"]["avg_blocked_count"].append(float(random_result["blocked_count"].mean().item()))
+        for key, value in (("success_rate", "success"), ("key_rate", "has_key"), ("avg_total_reward", "total_reward"), ("avg_blocked_count", "blocked_count")):
+            accum["random_policy"][key].append(float(random_result[value].mean().item()))
+
+        oracle_result = oracle_select_candidates(env, state, candidates, cfg)
+        for key, value in (("success_rate", "success"), ("key_rate", "has_key"), ("avg_total_reward", "total_reward"), ("avg_blocked_count", "blocked_count")):
+            accum["oracle_candidate"][key].append(float(oracle_result[value].mean().item()))
 
         for label, model in models.items():
             scores = score_candidates(model, label, initial_obs, candidates, cfg)
             best_idx = scores.argmax(dim=1)
             best_actions = candidates[torch.arange(cfg.batch_size, device=device), best_idx]
             result = execute_action_sequences(env, state, best_actions)
-            accum[label]["success_rate"].append(float(result["success"].mean().item()))
-            accum[label]["key_rate"].append(float(result["has_key"].mean().item()))
-            accum[label]["avg_total_reward"].append(float(result["total_reward"].mean().item()))
-            accum[label]["avg_blocked_count"].append(float(result["blocked_count"].mean().item()))
+            for key, value in (("success_rate", "success"), ("key_rate", "has_key"), ("avg_total_reward", "total_reward"), ("avg_blocked_count", "blocked_count")):
+                accum[label][key].append(float(result[value].mean().item()))
 
     rows: List[Dict[str, float]] = []
     for label, metrics in accum.items():
@@ -239,10 +270,7 @@ def evaluate_planning(models: Dict[str, object], cfg: PlanningConfig) -> List[Di
         for key, values in metrics.items():
             row[key] = sum(values) / len(values)
         rows.append(row)
-        print(
-            f"[{label}] success={row['success_rate']:.2%} key={row['key_rate']:.2%} "
-            f"reward={row['avg_total_reward']:.4f} blocked={row['avg_blocked_count']:.4f}"
-        )
+        print(f"[{label}] success={row['success_rate']:.2%} key={row['key_rate']:.2%} reward={row['avg_total_reward']:.4f} blocked={row['avg_blocked_count']:.4f}")
     return rows
 
 
