@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -82,7 +81,11 @@ class MemoryKeyDoorSequenceEnv:
     def sample_actions(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.randint(0, self.num_actions, (batch_size,), device=device)
 
-    def step_state(self, state: Dict[str, torch.Tensor], actions: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    def step_state(
+        self,
+        state: Dict[str, torch.Tensor],
+        actions: torch.Tensor,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         n = self.size
         agent = state["agent"]
         ax, ay = agent[:, 0], agent[:, 1]
@@ -99,16 +102,18 @@ class MemoryKeyDoorSequenceEnv:
         gx, gy = state["goal"][:, 0], state["goal"][:, 1]
         has_key = state["has_key"]
 
+        naive_moved = (nx != ax) | (ny != ay)
         blocked = (nx == dx) & (ny == dy) & (has_key == 0)
         nx = torch.where(blocked, ax, nx)
         ny = torch.where(blocked, ay, ny)
 
         collected_key = (nx == kx) & (ny == ky)
+        key_pickup = (has_key == 0) & collected_key
         next_has_key = ((has_key == 1) | collected_key).long()
         done = ((next_has_key == 1) & (nx == gx) & (ny == gy)).float()
         reward = torch.full_like(done, -0.02)
         reward = torch.where(blocked, torch.full_like(reward, -0.1), reward)
-        reward = torch.where((has_key == 0) & (next_has_key == 1), torch.full_like(reward, 0.2), reward)
+        reward = torch.where(key_pickup, torch.full_like(reward, 0.2), reward)
         reward = torch.where(done > 0, torch.ones_like(reward), reward)
 
         next_state = {
@@ -118,7 +123,12 @@ class MemoryKeyDoorSequenceEnv:
             "goal": state["goal"],
             "has_key": next_has_key,
         }
-        return next_state, reward, done
+        events = {
+            "blocked": blocked.float(),
+            "key_pickup": key_pickup.float(),
+            "naive_moved": naive_moved.float(),
+        }
+        return next_state, reward, done, events
 
     def sample_sequence(self, batch_size: int, horizon: int, device: torch.device):
         state = self.reset_state(batch_size, device)
@@ -129,15 +139,21 @@ class MemoryKeyDoorSequenceEnv:
         next_observations = []
         rewards = []
         dones = []
+        blocked_events = []
+        key_pickup_events = []
+        naive_moved_events = []
         for _ in range(horizon):
             action = self.sample_actions(batch_size, device)
-            next_state, reward, done = self.step_state(state, action)
+            next_state, reward, done, events = self.step_state(state, action)
             next_obs = self.hidden_obs(next_state)
             observations.append(current_obs)
             actions.append(action)
             next_observations.append(next_obs)
             rewards.append(reward)
             dones.append(done)
+            blocked_events.append(events["blocked"])
+            key_pickup_events.append(events["key_pickup"])
+            naive_moved_events.append(events["naive_moved"])
             state = next_state
             current_obs = next_obs
         return {
@@ -147,50 +163,112 @@ class MemoryKeyDoorSequenceEnv:
             "next_obs": torch.stack(next_observations, dim=1),
             "rewards": torch.stack(rewards, dim=1),
             "dones": torch.stack(dones, dim=1),
+            "blocked": torch.stack(blocked_events, dim=1),
+            "key_pickup": torch.stack(key_pickup_events, dim=1),
+            "naive_moved": torch.stack(naive_moved_events, dim=1),
         }
 
 
-def sequence_loss_sef(model: UniversalWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+def rollout_predict_sef(model: UniversalWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Dict[str, torch.Tensor]:
     state = model.init_state(seq["initial_obs"], sample_context=True)
-    obs_losses = []
-    reward_losses = []
-    done_losses = []
+    pred_obs = []
+    pred_rewards = []
+    pred_done_logits = []
     for t in range(cfg.rollout_horizon):
         state, pred = model.stateful_step(state, seq["actions"][:, t])
-        obs_losses.append(F.mse_loss(pred["next_obs"][:, : MemoryKeyDoorSequenceEnv.obs_dim], seq["next_obs"][:, t, : MemoryKeyDoorSequenceEnv.obs_dim]))
-        reward_losses.append(F.mse_loss(pred["reward"], seq["rewards"][:, t]))
-        done_losses.append(F.binary_cross_entropy_with_logits(pred["done_logit"], seq["dones"][:, t]))
-    obs_loss = torch.stack(obs_losses).mean()
-    reward_loss = torch.stack(reward_losses).mean()
-    done_loss = torch.stack(done_losses).mean()
+        pred_obs.append(pred["next_obs"])
+        pred_rewards.append(pred["reward"])
+        pred_done_logits.append(pred["done_logit"])
+    return {
+        "next_obs": torch.stack(pred_obs, dim=1),
+        "reward": torch.stack(pred_rewards, dim=1),
+        "done_logit": torch.stack(pred_done_logits, dim=1),
+    }
+
+
+def rollout_predict_mlp(model: MLPWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Dict[str, torch.Tensor]:
+    pred_obs = []
+    pred_rewards = []
+    pred_done_logits = []
+    current_obs = seq["initial_obs"]
+    for t in range(cfg.rollout_horizon):
+        dummy = WorldBatch(
+            obs=current_obs,
+            actions=seq["actions"][:, t],
+            next_obs=torch.zeros(current_obs.shape[0], cfg.max_obs_dim, device=current_obs.device),
+            rewards=torch.zeros(current_obs.shape[0], device=current_obs.device),
+            dones=torch.zeros(current_obs.shape[0], device=current_obs.device),
+        )
+        pred = model.forward(dummy)
+        current_obs = pred["pred_next_obs"]
+        pred_obs.append(current_obs)
+        pred_rewards.append(pred["pred_reward"])
+        pred_done_logits.append(pred["pred_done_logit"])
+    return {
+        "next_obs": torch.stack(pred_obs, dim=1),
+        "reward": torch.stack(pred_rewards, dim=1),
+        "done_logit": torch.stack(pred_done_logits, dim=1),
+    }
+
+
+def sequence_loss_from_predictions(pred: Dict[str, torch.Tensor], seq: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    obs_loss = F.mse_loss(pred["next_obs"][:, :, : MemoryKeyDoorSequenceEnv.obs_dim], seq["next_obs"][:, :, : MemoryKeyDoorSequenceEnv.obs_dim])
+    reward_loss = F.mse_loss(pred["reward"], seq["rewards"])
+    done_loss = F.binary_cross_entropy_with_logits(pred["done_logit"], seq["dones"])
     total = obs_loss + reward_loss + 0.2 * done_loss
     return total, {"obs_mse": obs_loss.detach(), "reward_mse": reward_loss.detach(), "done_bce": done_loss.detach()}
+
+
+def sequence_loss_sef(model: UniversalWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    return sequence_loss_from_predictions(rollout_predict_sef(model, seq, cfg), seq)
 
 
 def sequence_loss_mlp(model: MLPWorldModel, seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    obs_losses = []
-    reward_losses = []
-    done_losses = []
-    pred_obs = seq["initial_obs"]
-    for t in range(cfg.rollout_horizon):
-        dummy = WorldBatch(
-            obs=pred_obs,
-            actions=seq["actions"][:, t],
-            next_obs=torch.zeros(pred_obs.shape[0], cfg.max_obs_dim, device=pred_obs.device),
-            rewards=torch.zeros(pred_obs.shape[0], device=pred_obs.device),
-            dones=torch.zeros(pred_obs.shape[0], device=pred_obs.device),
-        )
-        pred = model.forward(dummy)
-        pred_next_obs = pred["pred_next_obs"]
-        obs_losses.append(F.mse_loss(pred_next_obs[:, : MemoryKeyDoorSequenceEnv.obs_dim], seq["next_obs"][:, t, : MemoryKeyDoorSequenceEnv.obs_dim]))
-        reward_losses.append(F.mse_loss(pred["pred_reward"], seq["rewards"][:, t]))
-        done_losses.append(F.binary_cross_entropy_with_logits(pred["pred_done_logit"], seq["dones"][:, t]))
-        pred_obs = pred_next_obs
-    obs_loss = torch.stack(obs_losses).mean()
-    reward_loss = torch.stack(reward_losses).mean()
-    done_loss = torch.stack(done_losses).mean()
-    total = obs_loss + reward_loss + 0.2 * done_loss
-    return total, {"obs_mse": obs_loss.detach(), "reward_mse": reward_loss.detach(), "done_bce": done_loss.detach()}
+    return sequence_loss_from_predictions(rollout_predict_mlp(model, seq, cfg), seq)
+
+
+def _binary_accuracy(pred: torch.Tensor, target: torch.Tensor) -> float:
+    return float((pred.float() == target.float()).float().mean().item())
+
+
+def _positive_recall(pred: torch.Tensor, target: torch.Tensor) -> float:
+    positives = target.float().sum()
+    if positives.item() <= 0:
+        return float("nan")
+    return float(((pred.float() == 1.0) & (target.float() == 1.0)).float().sum().item() / positives.item())
+
+
+def event_metrics_from_predictions(pred: Dict[str, torch.Tensor], seq: Dict[str, torch.Tensor], cfg: MemoryKeyDoorConfig) -> Dict[str, float]:
+    scale = float(cfg.size - 1)
+    pred_next_obs = pred["next_obs"]
+    true_next_obs = seq["next_obs"]
+
+    pred_has_key = (pred_next_obs[:, :, 8] > 0.5).float()
+    true_has_key = (true_next_obs[:, :, 8] > 0.5).float()
+    prev_true_has_key = (seq["obs"][:, :, 8] > 0.5).float()
+    pred_key_pickup = ((prev_true_has_key == 0.0) & (pred_has_key == 1.0)).float()
+    true_key_pickup = seq["key_pickup"].float()
+
+    pred_done = (torch.sigmoid(pred["done_logit"]) > 0.5).float()
+    true_done = seq["dones"].float()
+
+    pred_prev_agent = torch.cat([seq["initial_obs"][:, None, :2], pred_next_obs[:, :-1, :2]], dim=1)
+    pred_move_dist = (pred_next_obs[:, :, :2] - pred_prev_agent).abs().sum(dim=-1)
+    pred_blocked = ((pred_move_dist < (0.5 / scale)) & (seq["naive_moved"] > 0.5)).float()
+    true_blocked = seq["blocked"].float()
+
+    return {
+        "has_key_accuracy": _binary_accuracy(pred_has_key, true_has_key),
+        "key_pickup_accuracy": _binary_accuracy(pred_key_pickup, true_key_pickup),
+        "key_pickup_recall": _positive_recall(pred_key_pickup, true_key_pickup),
+        "blocked_accuracy": _binary_accuracy(pred_blocked, true_blocked),
+        "blocked_recall": _positive_recall(pred_blocked, true_blocked),
+        "done_accuracy": _binary_accuracy(pred_done, true_done),
+        "done_recall": _positive_recall(pred_done, true_done),
+        "key_pickup_rate": float(true_key_pickup.mean().item()),
+        "blocked_rate": float(true_blocked.mean().item()),
+        "done_rate": float(true_done.mean().item()),
+    }
 
 
 @torch.no_grad()
@@ -200,16 +278,22 @@ def evaluate_memory_keydoor(model, label: str, cfg: MemoryKeyDoorConfig) -> Dict
     obs_values = []
     reward_values = []
     done_values = []
+    event_values: Dict[str, List[float]] = {}
     for _ in range(cfg.eval_batches):
         seq = env.sample_sequence(cfg.batch_size, cfg.rollout_horizon, device)
         if label.startswith("sef"):
-            loss, metrics = sequence_loss_sef(model, seq, cfg)
+            pred = rollout_predict_sef(model, seq, cfg)
         else:
-            loss, metrics = sequence_loss_mlp(model, seq, cfg)
+            pred = rollout_predict_mlp(model, seq, cfg)
+        _, metrics = sequence_loss_from_predictions(pred, seq)
+        events = event_metrics_from_predictions(pred, seq, cfg)
         obs_values.append(float(metrics["obs_mse"].item()))
         reward_values.append(float(metrics["reward_mse"].item()))
         done_values.append(float(metrics["done_bce"].item()))
-    return {
+        for key, value in events.items():
+            if value == value:  # skip NaN batches for rare-event recall averages
+                event_values.setdefault(key, []).append(value)
+    row = {
         "model": label,
         "env": "memory_key_door",
         "horizon": float(cfg.rollout_horizon),
@@ -217,6 +301,9 @@ def evaluate_memory_keydoor(model, label: str, cfg: MemoryKeyDoorConfig) -> Dict
         "rollout_reward_mse_avg": sum(reward_values) / len(reward_values),
         "rollout_done_bce_avg": sum(done_values) / len(done_values),
     }
+    for key, values in event_values.items():
+        row[key] = sum(values) / len(values) if values else float("nan")
+    return row
 
 
 def train_memory_keydoor(cfg: MemoryKeyDoorConfig):
@@ -264,7 +351,11 @@ def run(cfg: MemoryKeyDoorConfig) -> List[Dict[str, float]]:
     for row in rows:
         print(
             f"{row['model']} obs={row['rollout_obs_mse_avg']:.4f} "
-            f"reward={row['rollout_reward_mse_avg']:.4f} done={row['rollout_done_bce_avg']:.4f}"
+            f"reward={row['rollout_reward_mse_avg']:.4f} done={row['rollout_done_bce_avg']:.4f} "
+            f"has_key_acc={row.get('has_key_accuracy', float('nan')):.2%} "
+            f"blocked_acc={row.get('blocked_accuracy', float('nan')):.2%} "
+            f"key_pickup_acc={row.get('key_pickup_accuracy', float('nan')):.2%} "
+            f"done_acc={row.get('done_accuracy', float('nan')):.2%}"
         )
     if cfg.export_csv:
         path = Path(cfg.export_csv)
